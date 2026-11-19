@@ -2,8 +2,10 @@ import os
 import json
 from datetime import datetime
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # อนุญาตให้ Web App จากทุกโดเมนหรือไฟล์ในเครื่องดึงข้อมูลได้
 app.json.ensure_ascii = False
 DB_FILE = "cloud_records.json"
 
