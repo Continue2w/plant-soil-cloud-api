@@ -27,8 +27,67 @@ def compute_vpd(temp_c, humid_pct):
     return round(max(0.0, svp - avp), 2)
 
 
+def process_device_telemetry(payload: dict, received_at: str) -> dict:
+    """ประมวลผลสถานะและความผิดปกติของข้อมูลที่ส่งมาจากตัวอุปกรณ์"""
+    device_id = str(payload.get("device_id") or "unknown-device").strip()
+    grid_location = str(payload.get("grid_location") or "unassigned").strip()
+    soil = payload.get("soil_5in1") or {}
+    env = payload.get("environment") or {}
+    ai = payload.get("leaf_ai_analysis") or {}
+
+    anomalies = []
+
+    for key, label in [
+        ("nitrogen_mg_kg", "N"),
+        ("phosphorus_mg_kg", "P"),
+        ("potassium_mg_kg", "K"),
+        ("moisture_pct", "ความชื้นดิน"),
+        ("ec", "EC"),
+    ]:
+        val = soil.get(key)
+        if isinstance(val, (int, float)) and val < 0:
+            anomalies.append(f"ค่า {label} ติดลบ ({val})")
+
+    moist = soil.get("moisture_pct")
+    if isinstance(moist, (int, float)) and (moist < 0 or moist > 100):
+        anomalies.append(f"ความชื้นดินอยู่นอกช่วง 0-100% ({moist})")
+
+    ph = soil.get("ph")
+    if isinstance(ph, (int, float)) and (ph < 0 or ph > 14):
+        anomalies.append(f"ค่า pH อยู่นอกช่วง 0-14 ({ph})")
+
+    has_soil = any(
+        soil.get(k) is not None
+        for k in ("nitrogen_mg_kg", "phosphorus_mg_kg", "potassium_mg_kg", "ph", "moisture_pct", "ec")
+    )
+    has_env = any(env.get(k) is not None for k in ("temperature_c", "humidity_pct", "vpd_kpa"))
+    has_ai = bool(ai.get("predicted_class"))
+
+    if anomalies:
+        device_health = "sensor_warning"
+    elif has_soil and has_ai:
+        device_health = "online_full_telemetry"
+    elif has_soil:
+        device_health = "online_soil_only"
+    else:
+        device_health = "online_partial"
+
+    return {
+        "device_id": device_id,
+        "grid_location": grid_location,
+        "last_seen": received_at,
+        "device_health": device_health,
+        "capabilities": {
+            "soil_5in1": has_soil,
+            "environment": has_env,
+            "leaf_ai": has_ai,
+        },
+        "anomalies": anomalies,
+    }
+
+
 def generate_prescription(payload: dict) -> dict:
-    """Prescription Engine: วิเคราะห์ค่าจริงทุกพารามิเตอร์ให้ตรงกับหน้า Web Dashboard"""
+    """Prescription Engine: วิเคราะห์ค่าดิน สภาพอากาศ และผล AI เพื่อสร้างคำแนะนำ"""
     plant = payload.get("plant", "rice")
     stage = payload.get("growth_stage", "early")
     target = CROP_PROFILES.get(plant, CROP_PROFILES["rice"]).get(stage, CROP_PROFILES["rice"]["early"])
@@ -59,7 +118,6 @@ def generate_prescription(payload: dict) -> dict:
     severity = "normal"
     risk_score = 0.0
 
-    # 1. วิเคราะห์ N-P-K เทียบกับเป้าหมายของระยะการเติบโตและผล AI
     if n < target["n"] or predicted_class == "low_n":
         recommendations.append(f"เสริมธาตุไนโตรเจน (N) ให้ถึงเป้าหมาย {int(target['n'])} mg/kg")
         severity = "warning"
@@ -73,7 +131,6 @@ def generate_prescription(payload: dict) -> dict:
         severity = "warning"
         risk_score += max(5.0, (target["k"] - k) * 0.3)
 
-    # 2. วิเคราะห์ pH, EC, ความชื้น และ VPD
     if ph < 5.5:
         recommendations.append("ดินเป็นกรดจัด ควรปรับปรุงดินด้วยปูนมาร์ลหรือโดโลไมท์ก่อนใส่ปุ๋ย")
         severity = "critical"
@@ -108,20 +165,17 @@ def generate_prescription(payload: dict) -> dict:
     if not recommendations:
         recommendations.append("สภาพดิน ใบข้าว และสภาพอากาศอยู่ในเกณฑ์สมดุล รักษาระดับน้ำและติดตามตามรอบ")
 
-    # 3. คำนวณวันคงเหลือของธาตุอาหาร (Decay Days) จากปริมาณจริงและอัตราชะล้างตามความชื้น
     leach_factor = 1.25 if moist > 75 else 1.0
     decay_n = max(1, round((n / 3.5) / leach_factor))
     decay_p = max(1, round((p / 1.5) / leach_factor))
     decay_k = max(1, round((k / 4.5) / leach_factor))
 
-    # 4. คำนวณดัชนีดิน FAO Ecotope (0-100%)
     ph_score = max(0, 100 - abs(ph - target["ph"]) * 40)
     moist_score = max(0, 100 - abs(moist - target["moist"]) * 2)
     npk_score = min(100, ((min(n / target["n"], 1.2) + min(p / target["p"], 1.2) + min(k / target["k"], 1.2)) / 3.0) * 100)
     fao_index = round((ph_score + moist_score + npk_score) / 3.0, 1)
     fao_label = "เหมาะสมมาก" if fao_index >= 80 else ("เหมาะสมปานกลาง" if fao_index >= 60 else "ต้องปรับปรุงดิน")
 
-    # 5. สรุปวิเคราะห์ 3 ช่วงเวลา (อดีต / ปัจจุบัน / พยากรณ์ 72 ชม.)
     moist_drop = history.get("moist_drop_rate_pct_day")
     past_text = (
         f"ความชื้นลดลงเฉลี่ย {float(moist_drop):.1f}%/วัน จากข้อมูลย้อนหลังจริง"
@@ -163,29 +217,62 @@ def generate_prescription(payload: dict) -> dict:
             "ph": ph,
             "ec": ec,
             "moisture_pct": moist,
-            "vpd_kpa": vpd
+            "vpd_kpa": vpd,
         },
         "decay_days": {
             "n": decay_n,
             "p": decay_p,
-            "k": decay_k
+            "k": decay_k,
         },
         "fao_ecotope": {
             "score_pct": fao_index,
-            "status": fao_label
+            "status": fao_label,
         },
         "yield_risk": {
             "risk_percent": risk_percent,
-            "impact_label": loss_est
+            "impact_label": loss_est,
         },
         "timeline": {
             "past_7d": past_text,
             "present": present_text,
             "future_72h": future_text,
-            "proactive_protocol": proactive_protocol
+            "proactive_protocol": proactive_protocol,
         },
-        "prescription_notes": recommendations
+        "prescription_notes": recommendations,
     }
+
+
+def build_devices_summary(records: list) -> list:
+    """สรุปสถานะของแต่ละอุปกรณ์จากประวัติข้อมูลทั้งหมด"""
+    devices_map = {}
+    for r in records:
+        payload = r.get("payload") or {}
+        dev_info = r.get("device_status") or process_device_telemetry(payload, r.get("received_at") or "")
+        dev_id = dev_info["device_id"]
+
+        if dev_id not in devices_map:
+            devices_map[dev_id] = {
+                "device_id": dev_id,
+                "grid_location": dev_info["grid_location"],
+                "total_packets": 0,
+                "anomaly_packets": 0,
+                "last_seen": dev_info["last_seen"],
+                "device_health": dev_info["device_health"],
+                "capabilities": dev_info["capabilities"],
+                "latest_anomalies": dev_info["anomalies"],
+            }
+
+        entry = devices_map[dev_id]
+        entry["total_packets"] += 1
+        if dev_info.get("anomalies"):
+            entry["anomaly_packets"] += 1
+        entry["grid_location"] = dev_info["grid_location"]
+        entry["last_seen"] = dev_info["last_seen"]
+        entry["device_health"] = dev_info["device_health"]
+        entry["capabilities"] = dev_info["capabilities"]
+        entry["latest_anomalies"] = dev_info["anomalies"]
+
+    return list(devices_map.values())
 
 
 def load_records() -> list:
@@ -205,7 +292,7 @@ def save_record(record: dict):
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"status": "Cloud API is running", "version": "2.0.0"})
+    return jsonify({"status": "Cloud API is running", "version": "2.1.0"})
 
 
 @app.route("/api/v1/sensor-data", methods=["POST"])
@@ -214,19 +301,24 @@ def receive_sensor_data():
     if not data or "soil_5in1" not in data:
         return jsonify({"error": "Missing required 'soil_5in1' data"}), 400
 
+    received_at = datetime.now().isoformat()
+    device_status = process_device_telemetry(data, received_at)
     prescription = generate_prescription(data)
+
     record = {
         "id": len(load_records()) + 1,
-        "received_at": datetime.now().isoformat(),
+        "received_at": received_at,
+        "device_status": device_status,
         "payload": data,
-        "prescription": prescription
+        "prescription": prescription,
     }
     save_record(record)
 
     return jsonify({
         "message": "Data received and processed",
         "record_id": record["id"],
-        "prescription": prescription
+        "device_status": device_status,
+        "prescription": prescription,
     }), 201
 
 
@@ -234,15 +326,32 @@ def receive_sensor_data():
 def get_records():
     records = load_records()
     grid_filter = request.args.get("grid")
+    device_filter = request.args.get("device_id")
+
     if grid_filter:
         records = [
             r for r in records
             if r.get("payload", {}).get("grid_location") == grid_filter
         ]
+    if device_filter:
+        records = [
+            r for r in records
+            if r.get("payload", {}).get("device_id") == device_filter
+        ]
 
     return jsonify({
         "count": len(records),
-        "records": records
+        "records": records,
+    })
+
+
+@app.route("/api/v1/devices", methods=["GET"])
+def get_devices():
+    records = load_records()
+    devices = build_devices_summary(records)
+    return jsonify({
+        "count": len(devices),
+        "devices": devices,
     })
 
 
