@@ -4,6 +4,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 DB_FILE = "cloud_records.json"
 
 
